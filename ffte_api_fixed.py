@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FFTE API Service with fixed scanner.
+FFTE API Service - FIXED to use actual target URLs instead of hardcoded victim API.
 """
 
 import uuid
@@ -96,99 +96,14 @@ class ScanManager:
                 return True
         return False
 
-# ================ Fixed Scanner ================
-class FixedFFTEScanner:
-    """Fixed scanner that actually tests for edge cases."""
-    
-    def scan_victim_api(self) -> Dict[str, Any]:
-        """
-        Scan the victim API and find division by zero bugs.
-        Returns a complete report.
-        """
-        from execution.http_executor import execute_request
-        from failure_detection.rules import classify
-        from reporting.report import ExecutionLogEntry, generate_report, format_report
-        
-        # Manual test cases for the /divide endpoint
-        test_cases = [
-            # Normal cases
-            {"a": 10, "b": 2},
-            {"a": 0, "b": 1},
-            {"a": -10, "b": 5},
-            
-            # Edge cases that should work
-            {"a": 0, "b": 100},
-            {"a": 999999, "b": 1},
-            {"a": -999999, "b": 1},
-            
-            # DIVISION BY ZERO BUGS (these should crash!)
-            {"a": 10, "b": 0},
-            {"a": 0, "b": 0},
-            {"a": -10, "b": 0},
-            {"a": 1, "b": 0},
-            {"a": -1, "b": 0},
-            
-            # Boundary cases
-            {"a": 2147483647, "b": 1},  # Max 32-bit int
-            {"a": -2147483648, "b": 1}, # Min 32-bit int
-            {"a": 2147483647, "b": 0},  # Max int ÷ 0 (should crash!)
-            {"a": -2147483648, "b": 0}, # Min int ÷ 0 (should crash!)
-        ]
-        
-        execution_entries = []
-        
-        for i, test_data in enumerate(test_cases):
-            result = execute_request(
-                method="POST",
-                url="http://127.0.0.1:8000/divide",
-                json=test_data,
-                timeout=10.0
-            )
-            
-            entry = ExecutionLogEntry(
-                method="POST",
-                url="http://127.0.0.1:8000/divide",
-                json_body=test_data,
-                result=result
-            )
-            execution_entries.append(entry)
-        
-        # Group failures and generate report
-        report = generate_report(execution_entries)
-        formatted = format_report(report)
-        
-        # Flatten failures for UI
-        failures_list = []
-        for entry in execution_entries:
-            res = entry._get_result()
-            if res:
-                classification = classify(res)
-                if classification.is_failure:
-                    failures_list.append({
-                        "method": entry.method,
-                        "url": entry.url,
-                        "type": classification.failure_type.value,
-                        "payload": json.dumps(entry.json_body or entry.data or {})
-                    })
-        
-        # Count failures
-        total_tests = len(test_cases)
-        failures_count = len(failures_list)
-        
-        return {
-            "total_tests": total_tests,
-            "failures": failures_count,
-            "failures_list": failures_list,
-            "report": report,
-            "formatted_report": formatted,
-        }
+# ================ Real Scanner (uses core.runner) ================
+from core.runner import run as core_run
 
 class FFTEScanner:
-    """Runs FFTE scans with the fixed scanner."""
+    """Runs FFTE scans using the actual core runner."""
     
     def __init__(self, scan_manager: ScanManager):
         self.scan_manager = scan_manager
-        self.fixed_scanner = FixedFFTEScanner()
     
     def run_scan(self, scan_id: str):
         """Run a scan in a background thread."""
@@ -197,11 +112,70 @@ class FFTEScanner:
             if not scan:
                 return
             
+            request_data = scan["request"]
+            spec_url = request_data.get("target_url") or request_data.get("spec_url")
+            base_url = request_data.get("base_url")
+            max_cases = request_data.get("max_cases_per_field", 3)
+            
+            if not spec_url:
+                raise ValueError("No spec_url or target_url provided")
+            
             # Update status to running
             self.scan_manager.update_scan(scan_id, status="running", progress=10.0)
             
-            # Run the scan
-            results = self.fixed_scanner.scan_victim_api()
+            # Run the actual FFTE core scanner
+            print(f"🔍 Starting scan on: {spec_url}")
+            print(f"   Base URL: {base_url or 'auto-detect'}")
+            print(f"   Max cases per field: {max_cases}")
+            
+            # Use the actual core runner from core/runner.py
+            report = core_run(
+                spec_url=spec_url,
+                base_url=base_url,
+                timeout=10.0,
+                limit_endpoints=None
+            )
+            
+            # Count statistics
+            from reporting.report import format_report
+            
+            total_failures = sum(len(cmds) for cmds in report.values())
+            formatted = format_report(report)
+            
+            # Convert report to failures list for UI
+            failures_list = []
+            for failure_type, curl_commands in report.items():
+                for cmd in curl_commands:
+                    # Parse curl command to extract method, url, payload
+                    method = "POST" if "-X POST" in cmd else "GET"
+                    url = ""
+                    payload = "{}"
+                    
+                    # Extract URL (between quotes after curl)
+                    import re
+                    url_match = re.search(r'"(https?://[^"]+)"', cmd)
+                    if url_match:
+                        url = url_match.group(1)
+                    
+                    # Extract payload (after -d)
+                    payload_match = re.search(r"-d '([^']+)'", cmd)
+                    if payload_match:
+                        payload = payload_match.group(1)
+                    
+                    failures_list.append({
+                        "method": method,
+                        "url": url,
+                        "type": failure_type,
+                        "payload": payload
+                    })
+            
+            # Get endpoint count from spec
+            from surface_discovery.openapi_parser import fetch_and_parse
+            try:
+                endpoints = fetch_and_parse(spec_url)
+                endpoint_count = len(endpoints)
+            except:
+                endpoint_count = 0
             
             # Update with results
             self.scan_manager.update_scan(
@@ -209,21 +183,25 @@ class FFTEScanner:
                 status="completed",
                 progress=100.0,
                 end_time=datetime.now(),
-                tests_executed=results["total_tests"],
-                failures_found=results["failures"],
+                tests_executed=len(failures_list),
+                failures_found=total_failures,
                 results={
-                    "report": results["report"],
-                    "failures": results["failures_list"],
-                    "formatted_report": results["formatted_report"],
+                    "report": report,
+                    "failures": failures_list,
+                    "formatted_report": formatted,
                     "statistics": {
-                        "total_tests": results["total_tests"],
-                        "failures": results["failures"],
-                        "endpoints": 1  # We only test /divide
+                        "total_tests": len(failures_list),
+                        "failures": total_failures,
+                        "endpoints": endpoint_count
                     }
                 }
             )
             
+            print(f"✅ Scan completed: {total_failures} failures found")
+            
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             self.scan_manager.update_scan(
                 scan_id,
                 status="failed",
@@ -235,8 +213,8 @@ class FFTEScanner:
 # ================ FastAPI App ================
 app = FastAPI(
     title="FFTE API",
-    description="Failure-First Testing Engine - REST API",
-    version="1.0.0"
+    description="Failure-First Testing Engine - REST API (FIXED VERSION)",
+    version="2.0.0"
 )
 
 # Initialize components
@@ -265,6 +243,15 @@ async def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
     req_dict["target_url"] = url 
     
     scan_id = str(uuid.uuid4())
+    
+    # Get endpoint info for UI preview (non-blocking)
+    try:
+        from surface_discovery.openapi_parser import fetch_and_parse
+        endpoints = fetch_and_parse(url)
+        endpoint_previews = [{"method": e.method.upper(), "path": e.path} for e in endpoints[:10]]
+    except:
+        endpoint_previews = []
+    
     scan_data = {
         "scan_id": scan_id,
         "request": req_dict,
@@ -274,7 +261,7 @@ async def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
         "end_time": None,
         "tests_executed": 0,
         "failures_found": 0,
-        "endpoints": [{"method": "POST", "path": "/divide"}], # Mock endpoints for UI
+        "endpoints": endpoint_previews,
         "results": None,
         "error": None,
     }
@@ -375,59 +362,16 @@ async def health_check():
     """
     return {
         "status": "healthy",
-        "service": "ffte-api-fixed",
-        "version": "1.0.0",
+        "service": "ffte-api-fixed-v2",
+        "version": "2.0.0",
         "timestamp": datetime.now().isoformat(),
         "scans_count": len(scan_manager.scans)
-    }
-
-@app.get("/api/demo/victim-test")
-async def demo_victim_test():
-    """
-    Demo endpoint that tests against the victim API.
-    """
-    from execution.http_executor import execute_request
-    from failure_detection.rules import classify
-    
-    result = execute_request(
-        method="POST",
-        url="http://127.0.0.1:8000/divide",
-        json={"a": 10, "b": 0}
-    )
-    
-    classification = classify(result)
-    
-    return {
-        "test": "division_by_zero",
-        "payload": {"a": 10, "b": 0},
-        "status_code": result.status_code,
-        "failure_type": classification.failure_type.value,
-        "is_failure": classification.is_failure,
-        "message": "FFTE caught this bug automatically!",
-        "curl_command": "curl -X POST 'http://127.0.0.1:8000/divide' -H 'Content-Type: application/json' -d '{\"a\": 10, \"b\": 0}'"
-    }
-
-@app.get("/api/quick-scan")
-async def quick_scan():
-    """
-    Run a quick scan and return immediate results.
-    """
-    scanner = FixedFFTEScanner()
-    results = scanner.scan_victim_api()
-    
-    return {
-        "status": "completed",
-        "results": {
-            "total_tests": results["total_tests"],
-            "failures": results["failures"],
-            "report_preview": results["formatted_report"][:500] + "..." if len(results["formatted_report"]) > 500 else results["formatted_report"]
-        }
     }
 
 # ================ Run the API ================
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 Starting FFTE API Server (Fixed Version)...")
+    print("🚀 Starting FFTE API Server (FIXED v2.0)...")
     print("📚 API Documentation: http://localhost:8001/docs")
     print("🔗 Available endpoints:")
     print("   POST   /api/scan/start     - Start new scan")
@@ -435,6 +379,4 @@ if __name__ == "__main__":
     print("   GET    /api/scans          - List all scans")
     print("   DELETE /api/scan/{id}      - Delete scan")
     print("   GET    /api/health         - Health check")
-    print("   GET    /api/demo/victim-test - Demo endpoint")
-    print("   GET    /api/quick-scan     - Immediate scan results")
     uvicorn.run(app, host="0.0.0.0", port=8001)
