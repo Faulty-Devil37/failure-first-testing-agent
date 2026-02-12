@@ -1,21 +1,15 @@
-"""
-OpenAPI spec parser for surface discovery.
-"""
-
+"""OpenAPI spec parser with $ref resolution."""
 from __future__ import annotations
-
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
-
 import requests
 
 
 @dataclass
 class Parameter:
-    """OpenAPI parameter specification."""
     name: str
-    location: str  # "path", "query", "header", "cookie"
+    location: str
     param_type: Optional[str] = None
     required: bool = False
     schema: Optional[Dict[str, Any]] = None
@@ -23,9 +17,8 @@ class Parameter:
 
 @dataclass
 class Endpoint:
-    """Represents an API endpoint discovered from OpenAPI spec."""
     path: str
-    method: str  # "get", "post", "put", "delete", etc.
+    method: str
     summary: Optional[str] = None
     parameters: List[Parameter] = None
     request_body_schema: Optional[Dict[str, Any]] = None
@@ -36,88 +29,103 @@ class Endpoint:
             self.parameters = []
 
 
+def resolve_refs(schema: Any, spec: Dict[str, Any]) -> Any:
+    """Resolve all $ref in schema recursively."""
+    if not isinstance(schema, dict):
+        return schema
+    
+    if "$ref" in schema:
+        ref = schema["$ref"]
+        if ref.startswith("#/"):
+            parts = ref[2:].split("/")
+            obj = spec
+            for part in parts:
+                obj = obj.get(part, {})
+            return resolve_refs(obj, spec)
+    
+    result = {}
+    for k, v in schema.items():
+        if isinstance(v, dict):
+            result[k] = resolve_refs(v, spec)
+        elif isinstance(v, list):
+            result[k] = [resolve_refs(item, spec) if isinstance(item, dict) else item for item in v]
+        else:
+            result[k] = v
+    return result
+
+
 def fetch_and_parse(openapi_url: str) -> List[Endpoint]:
-    """
-    Fetch OpenAPI spec from URL and parse it into Endpoint objects.
+    response = requests.get(openapi_url, timeout=10)
+    response.raise_for_status()
+    spec = response.json()
     
-    Args:
-        openapi_url: URL to OpenAPI spec (e.g., http://localhost:8000/openapi.json)
-    
-    Returns:
-        List of discovered Endpoint objects
-    """
-    try:
-        response = requests.get(openapi_url, timeout=10)
-        response.raise_for_status()
-        spec = response.json()
-        return _parse_spec(spec)
-    except requests.RequestException as e:
-        raise ValueError(f"Failed to fetch OpenAPI spec from {openapi_url}: {e}")
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON in OpenAPI spec: {e}")
-
-
-def _parse_spec(spec: Dict[str, Any]) -> List[Endpoint]:
-    """Parse OpenAPI spec dictionary into Endpoint objects."""
     endpoints = []
-    
-    paths = spec.get("paths", {})
-    for path, methods in paths.items():
+    for path, methods in spec.get("paths", {}).items():
         for method, details in methods.items():
-            # Normalize method to lowercase
-            method_lower = method.lower()
+            params = []
+            for p in details.get("parameters", []):
+                params.append(Parameter(
+                    name=p.get("name", ""),
+                    location=p.get("in", ""),
+                    param_type=p.get("schema", {}).get("type"),
+                    required=p.get("required", False),
+                    schema=resolve_refs(p.get("schema", {}), spec)
+                ))
             
-            # Parse parameters
-            parameters = []
-            for param_spec in details.get("parameters", []):
-                param = Parameter(
-                    name=param_spec.get("name", ""),
-                    location=param_spec.get("in", ""),
-                    param_type=param_spec.get("schema", {}).get("type"),
-                    required=param_spec.get("required", False),
-                    schema=param_spec.get("schema")
-                )
-                parameters.append(param)
-            
-            # Parse request body
-            request_body_schema = None
-            request_body = details.get("requestBody", {})
-            if request_body:
-                content = request_body.get("content", {})
-                for content_type, content_spec in content.items():
-                    if "application/json" in content_type or "json" in content_type:
-                        request_body_schema = content_spec.get("schema")
+            body_schema = None
+            req_body = details.get("requestBody", {})
+            if req_body:
+                for ct, ct_spec in req_body.get("content", {}).items():
+                    if "json" in ct:
+                        body_schema = resolve_refs(ct_spec.get("schema", {}), spec)
                         break
             
-            endpoint = Endpoint(
+            endpoints.append(Endpoint(
                 path=path,
-                method=method_lower,
+                method=method.lower(),
                 summary=details.get("summary"),
-                parameters=parameters,
-                request_body_schema=request_body_schema,
+                parameters=params,
+                request_body_schema=body_schema,
                 operation_id=details.get("operationId")
-            )
-            endpoints.append(endpoint)
+            ))
     
     return endpoints
 
 
 def parse_from_file(file_path: str) -> List[Endpoint]:
-    """
-    Parse OpenAPI spec from a local file.
-    
-    Args:
-        file_path: Path to OpenAPI spec file (JSON or YAML)
-    
-    Returns:
-        List of discovered Endpoint objects
-    """
     import yaml
-    
     with open(file_path, 'r', encoding='utf-8') as f:
-        if file_path.endswith('.yaml') or file_path.endswith('.yml'):
-            spec = yaml.safe_load(f)
-        else:
-            spec = json.load(f)
+        spec = yaml.safe_load(f) if file_path.endswith(('.yaml', '.yml')) else json.load(f)
     
-    return _parse_spec(spec)
+    # For file parsing, we need to call internal parse logic
+    endpoints = []
+    for path, methods in spec.get("paths", {}).items():
+        for method, details in methods.items():
+            params = []
+            for p in details.get("parameters", []):
+                params.append(Parameter(
+                    name=p.get("name", ""),
+                    location=p.get("in", ""),
+                    param_type=p.get("schema", {}).get("type"),
+                    required=p.get("required", False),
+                    schema=resolve_refs(p.get("schema", {}), spec)
+                ))
+            
+            body_schema = None
+            req_body = details.get("requestBody", {})
+            if req_body:
+                for ct, ct_spec in req_body.get("content", {}).items():
+                    if "json" in ct:
+                        body_schema = resolve_refs(ct_spec.get("schema", {}), spec)
+                        break
+            
+            endpoints.append(Endpoint(
+                path=path,
+                method=method.lower(),
+                summary=details.get("summary"),
+                parameters=params,
+                request_body_schema=body_schema,
+                operation_id=details.get("operationId")
+            ))
+    
+    return endpoints
